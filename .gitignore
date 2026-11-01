@@ -1,0 +1,4 @@
+Sample.xcodeproj/
+Sources/Info.plist
+*.ipa
+build/
