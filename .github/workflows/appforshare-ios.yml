@@ -1,0 +1,130 @@
+# Made by AppForShare (https://v2.appforshare.io/docs/github-builds). Builds the iOS app on this repository's
+# GitHub Actions minutes and sends it to AppForShare, where testers install it from a link.
+# You can edit this file. AppForShare only starts it and reads its runs.
+name: AppForShare iOS build
+run-name: "AppForShare build ${{ inputs.afs_run || github.sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      afs_run:
+        description: Set by AppForShare to match the run
+        required: false
+        default: ''
+      release_notes:
+        description: Release notes for testers
+        required: false
+        default: ''
+      channel:
+        description: AppForShare channel (beta, live)
+        required: false
+        default: ''
+      build_number:
+        description: Build number for this run (empty = the setup's choice)
+        required: false
+        default: ''
+
+concurrency:
+  group: appforshare-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      AFS_HAS_CERT: ${{ secrets.APPFORSHARE_CERT_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        run: |
+          brew install xcodegen && xcodegen generate
+
+      - name: App Store Connect key
+        env:
+          ASC_KEY_P8: ${{ secrets.APPFORSHARE_ASC_KEY_P8 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/asc/AuthKey.p8"
+
+      - name: Distribution certificate (only if you added one)
+        env:
+          CERT_P12: ${{ secrets.APPFORSHARE_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPFORSHARE_CERT_PASSWORD }}
+        if: env.AFS_HAS_CERT == 'true'
+        run: |
+          KC="$RUNNER_TEMP/afs.keychain-db"
+          KP=$(openssl rand -hex 16)
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KP" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Archive
+        env:
+          ASC_KEY_ID: ${{ secrets.APPFORSHARE_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APPFORSHARE_ASC_ISSUER_ID }}
+          AFS_INPUT_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -o pipefail
+          AFS_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          if [ -n "$AFS_INPUT_NUMBER" ]; then AFS_BUILD_NUMBER="$AFS_INPUT_NUMBER"; fi
+          if [ -n "$AFS_BUILD_NUMBER" ] && ! [[ "$AFS_BUILD_NUMBER" =~ ^[0-9]{1,18}(\.[0-9]{1,6}){0,2}$ ]]; then echo "::error::Build number $AFS_BUILD_NUMBER is not numbers and dots."; exit 1; fi
+          [ -n "$AFS_BUILD_NUMBER" ] && echo "Build number $AFS_BUILD_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          xcodebuild archive -project 'Sample.xcodeproj' -scheme 'Sample' -configuration 'Release' \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey.p8" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM=KD623CB684 CODE_SIGN_STYLE=Automatic${AFS_BUILD_NUMBER:+ CURRENT_PROJECT_VERSION=$AFS_BUILD_NUMBER} > "$RUNNER_TEMP/archive.log" 2>&1 || { grep -E "error:|warning: .*[Ss]ign" "$RUNNER_TEMP/archive.log" | head -n 50; tail -n 200 "$RUNNER_TEMP/archive.log"; exit 1; }
+          tail -n 20 "$RUNNER_TEMP/archive.log"
+
+      - name: Export .ipa
+        id: export
+        env:
+          ASC_KEY_ID: ${{ secrets.APPFORSHARE_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APPFORSHARE_ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          AFS_PROFILE_XML=$(printf '%s' "${AFS_PROFILE_NAME:-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g')
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>release-testing</string>
+            <key>teamID</key><string>KD623CB684</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>destination</key><string>export</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey.p8" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" 2>&1 | tail -n 100
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa | head -n 1)
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to AppForShare
+        id: appforshare
+        uses: appforshare/appforshare-action@v1
+        with:
+          file: ${{ steps.export.outputs.ipa }}
+          token: ${{ secrets.APPFORSHARE_TOKEN }}
+          release-notes: ${{ inputs.release_notes }}
+          channel: ${{ inputs.channel }}
+          api-url: https://v2.appforshare.io
+
+      - name: Install link
+        env:
+          AFS_URL: ${{ steps.appforshare.outputs.url }}
+        run: echo "Install link $AFS_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the key
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/asc" ~/.appstoreconnect/private_keys "$RUNNER_TEMP/afs.mobileprovision"
+          security delete-keychain "$RUNNER_TEMP/afs.keychain-db" 2>/dev/null || true
