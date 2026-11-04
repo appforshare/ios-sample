@@ -23,6 +23,12 @@ on:
         description: Build number for this run (empty = the setup's choice)
         required: false
         default: ''
+      export_method:
+        description: Export method (release-testing = ad hoc, app-store-connect = TestFlight / App Store)
+        required: false
+        type: choice
+        options: [release-testing, app-store-connect]
+        default: release-testing
 
 concurrency:
   group: appforshare-ios-${{ github.ref }}
@@ -90,14 +96,17 @@ jobs:
         env:
           ASC_KEY_ID: ${{ secrets.APPFORSHARE_ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APPFORSHARE_ASC_ISSUER_ID }}
+          AFS_EXPORT_METHOD: ${{ inputs.export_method || 'release-testing' }}
         run: |
           set -o pipefail
+          case "$AFS_EXPORT_METHOD" in release-testing|app-store-connect) ;; *) echo "::error::Unknown export method $AFS_EXPORT_METHOD"; exit 1;; esac
+          echo "Export method $AFS_EXPORT_METHOD" >> "$GITHUB_STEP_SUMMARY"
           AFS_PROFILE_XML=$(printf '%s' "${AFS_PROFILE_NAME:-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g')
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>method</key><string>release-testing</string>
+            <key>method</key><string>$AFS_EXPORT_METHOD</string>
             <key>teamID</key><string>KD623CB684</string>
             <key>signingStyle</key><string>automatic</string>
             <key>destination</key><string>export</string>
